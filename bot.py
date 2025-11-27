@@ -252,8 +252,8 @@ async def ban_prefix(ctx, member: discord.Member, *, reason: str = "No reason"):
 
 @bot.tree.command(name="ban", description="Ban a member (Xtreme)")
 @app_commands.checks.has_permissions(ban_members=True)
-@app_commands.describe(member="Jisko ban karna hai", reason: "Reason")
-async def ban_slash(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+@app_commands.describe(member="Jisko ban karna hai", reason: "Ban ka Reason")
+async def ban_slash(interaction: discord.Interaction, member: discord.Member, reason: str):
     if not await can_act(interaction, member):
         return
     await member.ban(reason=reason)
