@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_BOT_TOKEN = os.getenv("MTQ0MzQwNzkyOTg1MTExNzU2OA.G4QdpV.MrhW5LxDBFOvxFfCIrdSz3WR3KY5z9-JxSLxO4")
 if not DISCORD_BOT_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN missing hai!")
 
