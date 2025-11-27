@@ -7,387 +7,425 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
-# ----------------- ENV + BASIC SETUP -----------------
+# ------------- ENV SETUP -------------
 
 load_dotenv()
-
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
 if not DISCORD_BOT_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN missing hai! Render / .env me set karo.")
 
+
+# ------------- INTENTS -------------
+
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # roles/members ke liye
+intents.members = True
+
+
+# ------------- CUSTOM BOT CLASS -------------
 
 class XtremeBot(commands.Bot):
-    async def on_ready(self):
+    def __init__(self, *args, **kwargs):
+        # default help command disable
+        kwargs["help_command"] = None
+        super().__init__(*args, **kwargs)
+
+    async def setup_hook(self) -> None:
+        # slash commands sync
         try:
-            synced = await self.tree.sync()
-            print(f"🔥 Xtreme online — {len(synced)} slash commands synced ⚡")
+            await self.tree.sync()
+            print("Slash commands synced ✅")
         except Exception as e:
             print("Slash sync error:", e)
 
+
 bot = XtremeBot(command_prefix="!", intents=intents)
 
-# ----------------- WARN STORAGE (IN-MEMORY) -----------------
-# warnings[(guild_id, user_id)] = count
+
+# ------------- WARN STORAGE (IN-MEMORY) -------------
+
+# warnings_store[guild_id][user_id] = count
 warnings_store = {}
 
-# ----------------- TIMEOUT DURATIONS -----------------
+# ------------- TIMEOUT DURATIONS -------------
 
-ALLOWED_DURATIONS = {
+TIMEOUT_PRESET = {
     "10s": timedelta(seconds=10),
     "1m": timedelta(minutes=1),
     "10m": timedelta(minutes=10),
     "1h": timedelta(hours=1),
     "2h": timedelta(hours=2),
 }
-REMOVE_KEYS = ("remove", "off", "none")
 
-def list_allowed_durations() -> str:
-    return ", ".join(ALLOWED_DURATIONS.keys()) + ", remove"
 
-# ----------------- ROLE / PERMISSION SAFETY -----------------
+# ------------- UTILITY HELPERS -------------
 
-async def can_act(ctx_or_inter, target: discord.Member) -> bool:
+def get_warn_count(guild_id: int, user_id: int) -> int:
+    return warnings_store.get(guild_id, {}).get(user_id, 0)
+
+
+def add_warn(guild_id: int, user_id: int) -> int:
+    if guild_id not in warnings_store:
+        warnings_store[guild_id] = {}
+    warnings_store[guild_id][user_id] = warnings_store[guild_id].get(user_id, 0) + 1
+    return warnings_store[guild_id][user_id]
+
+
+def remove_warns(guild_id: int, user_id: int) -> None:
+    if guild_id in warnings_store and user_id in warnings_store[guild_id]:
+        del warnings_store[guild_id][user_id]
+
+
+async def can_act_on(
+    interaction_or_ctx,
+    moderator: discord.Member,
+    target: discord.Member,
+) -> bool:
     """
-    Check karega ki user + bot dono is member par action le sakte hain ya nahi.
-    ctx_or_inter = commands.Context ya discord.Interaction
+    Role hierarchy + self/bot protection
+    interaction_or_ctx -> ctx ya interaction
     """
+    # can't act on self
+    if target.id == moderator.id:
+        msg = "Apne aap pe action nahi le sakte 😅"
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction_or_ctx.send(msg)
+        return False
+
+    # can't act on bot
+    if target.bot:
+        msg = "Bot pe aise action nahi le sakte 😐"
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction_or_ctx.send(msg)
+        return False
+
     guild = target.guild
-    me = guild.me
+    bot_member = guild.me
 
-    # Author / send function decide
-    if isinstance(ctx_or_inter, discord.Interaction):
-        author = ctx_or_inter.user
-
-        async def send(msg: str):
-            if not ctx_or_inter.response.is_done():
-                await ctx_or_inter.response.send_message(msg)
-            else:
-                await ctx_or_inter.followup.send(msg)
-    else:
-        author = ctx_or_inter.author
-
-        async def send(msg: str):
-            await ctx_or_inter.send(msg)
-
-    # Khud par action
-    if target == author:
-        await send("Khud ko hi punish karega? 😅")
+    # moderator role check
+    if moderator.top_role <= target.top_role and guild.owner_id != moderator.id:
+        msg = "Unke role tumse upar ya barabar hai 😶 Action allowed nahi."
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction_or_ctx.send(msg)
         return False
 
-    # Server owner
-    if target == guild.owner:
-        await send("Server owner par action nahi le sakte 😶")
-        return False
-
-    # Author role <= target role
-    if author.top_role <= target.top_role and author != guild.owner:
-        await send("Tera role usse neeche/equal hai, is par action nahi le sakta ⚠️")
-        return False
-
-    # Bot role <= target role
-    if me.top_role <= target.top_role:
-        await send("Mera (Xtreme ka) role usse neeche hai, main uspe action nahi le sakta 😔")
+    # bot role check
+    if bot_member.top_role <= target.top_role:
+        msg = "Mera role unse niche hai 😭 mujhe upar role do phir try karo."
+        if isinstance(interaction_or_ctx, discord.Interaction):
+            await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction_or_ctx.send(msg)
         return False
 
     return True
 
-# ----------------- TIMEOUT COMMON LOGIC -----------------
 
-async def timeout_logic(ctx_or_inter, member: discord.Member, duration_key: str, reason: str, slash: bool):
-    """Prefix + slash dono yahi use karenge."""
-    if not await can_act(ctx_or_inter, member):
+async def do_timeout(
+    interaction_or_ctx,
+    target: discord.Member,
+    delta: timedelta,
+    reason: str,
+):
+    guild = target.guild
+
+    if isinstance(interaction_or_ctx, discord.Interaction):
+        moderator = interaction_or_ctx.user
+    else:
+        moderator = interaction_or_ctx.author
+
+    if not await can_act_on(interaction_or_ctx, moderator, target):
         return
 
-    # send helper
-    if isinstance(ctx_or_inter, discord.Interaction):
-        async def send(msg: str):
-            if not ctx_or_inter.response.is_done():
-                await ctx_or_inter.response.send_message(msg)
-            else:
-                await ctx_or_inter.followup.send(msg)
-    else:
-        async def send(msg: str):
-            await ctx_or_inter.send(msg)
+    until = discord.utils.utcnow() + delta
+    await target.timeout(until=until, reason=reason)
 
-    try:
-        dk = duration_key.lower()
-
-        if dk in REMOVE_KEYS:
-            await member.edit(timed_out_until=None, reason=reason)
-            msg = f"✅ {member.mention} ka timeout hata diya.\nReason: {reason}"
-        else:
-            delta = ALLOWED_DURATIONS.get(dk)
-            if not delta:
-                msg = f"❌ Invalid duration! Allowed: `{list_allowed_durations()}`"
-            else:
-                until = discord.utils.utcnow() + delta
-                await member.edit(timed_out_until=until, reason=reason)
-                msg = (
-                    "⏳ **Xtreme Timeout Executed**\n"
-                    f"👤 User: {member.mention}\n"
-                    f"⌛ Duration: `{duration_key}`\n"
-                    f"📄 Reason: {reason}"
-                )
-
-        await send(msg)
-
-    except Exception as e:
-        await send(f"Timeout failed 😭 — `{e}`")
-
-# ----------------- WARN SYSTEM -----------------
-
-def add_warning(guild_id: int, user_id: int) -> int:
-    key = (guild_id, user_id)
-    warnings_store[key] = warnings_store.get(key, 0) + 1
-    return warnings_store[key]
-
-def get_warnings(guild_id: int, user_id: int) -> int:
-    return warnings_store.get((guild_id, user_id), 0)
-
-async def issue_warn(ctx_or_inter, member: discord.Member, reason: str, slash: bool):
-    if not await can_act(ctx_or_inter, member):
-        return
-
-    guild = member.guild
-    count = add_warning(guild.id, member.id)
-
-    # Decide auto action
-    auto_action = None  # (type, duration_key | None)
-    if count == 2:
-        auto_action = ("timeout", "10m")
-    elif count == 3:
-        auto_action = ("timeout", "1h")
-    elif count == 4:
-        auto_action = ("kick", None)
-    elif count >= 5:
-        auto_action = ("ban", None)
-
-    # Helper for sending
-    if isinstance(ctx_or_inter, discord.Interaction):
-        async def send(msg: str):
-            if not ctx_or_inter.response.is_done():
-                await ctx_or_inter.response.send_message(msg)
-            else:
-                await ctx_or_inter.followup.send(msg)
-    else:
-        async def send(msg: str):
-            await ctx_or_inter.send(msg)
-
-    # DM to user
-    try:
-        dm_text = (
-            f"⚠️ You received a warning in **{guild.name}**.\n"
-            f"Reason: {reason}\n"
-            f"Total Warns: {count}"
-        )
-        if auto_action:
-            atype, dur = auto_action
-            if atype == "timeout":
-                dm_text += f"\nAuto Action: Timeout `{dur}` by Xtreme."
-            elif atype == "kick":
-                dm_text += "\nAuto Action: Kick by Xtreme."
-            elif atype == "ban":
-                dm_text += "\nAuto Action: Ban by Xtreme."
-        await member.send(dm_text)
-    except discord.Forbidden:
-        # User ke DM band ho sakte hain
-        pass
-
-    base_msg = (
-        "⚠️ **Xtreme Warn Issued**\n"
-        f"👤 User: {member.mention}\n"
-        f"📄 Reason: {reason}\n"
-        f"📊 Total Warns: `{count}`"
+    msg = (
+        f"⏳ {target.mention} ko `{delta}` ke liye timeout diya gaya.\n"
+        f"Reason: **{reason}**"
     )
 
-    # Apply auto action
-    if auto_action:
-        atype, dur = auto_action
-        extra = ""
-        if atype == "timeout" and dur:
-            await timeout_logic(ctx_or_inter, member, dur, f"Auto timeout (warns = {count})", slash)
-            extra = f"\n🚨 Auto Action: Timeout `{dur}`"
-        elif atype == "kick":
-            await member.kick(reason=f"Auto kick (warns = {count})")
-            extra = "\n🚨 Auto Action: Kick"
-        elif atype == "ban":
-            await member.ban(reason=f"Auto ban (warns = {count})")
-            extra = "\n🚨 Auto Action: Ban"
-
-        await send(base_msg + extra)
+    if isinstance(interaction_or_ctx, discord.Interaction):
+        await interaction_or_ctx.response.send_message(msg)
     else:
-        await send(base_msg)
+        await interaction_or_ctx.send(msg)
 
-# ----------------- KICK (PREFIX + SLASH) -----------------
+
+# ------------- EVENTS -------------
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("Xtreme bot online ⚡")
+
+
+# ------------- MODERATION: KICK -------------
 
 @bot.command(name="kick")
 @commands.has_permissions(kick_members=True)
 async def kick_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason"):
-    if not await can_act(ctx, member):
+    if not await can_act_on(ctx, ctx.author, member):
         return
-    await member.kick(reason=reason)
-    await ctx.send(
-        "👢 **Xtreme Kick Executed**\n"
-        f"👤 User: {member.mention}\n"
-        f"📄 Reason: {reason}\n"
-        f"👮 Mod: {ctx.author.mention}"
-    )
 
-@bot.tree.command(name="kick", description="Kick a member (Xtreme)")
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 {member.mention} ko kick kar diya gaya. Reason: **{reason}**")
+
+
+@kick_prefix.error
+async def kick_prefix_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Tumhare paas kick permission nahi hai 😶")
+
+
+@bot.tree.command(name="kick", description="Kick a member")
 @app_commands.checks.has_permissions(kick_members=True)
-@app_commands.describe(
-    member="Jisko kick karna hai",
-    reason="Reason (optional)"
-)
 async def kick_slash(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str = "No reason",
 ):
-    if not await can_act(interaction, member):
+    if not await can_act_on(interaction, interaction.user, member):
         return
+
     await member.kick(reason=reason)
     await interaction.response.send_message(
-        "👢 **Xtreme Kick Executed**\n"
-        f"👤 User: {member.mention}\n"
-        f"📄 Reason: {reason}\n"
-        f"👮 Mod: {interaction.user.mention}"
+        f"👢 {member.mention} ko kick kar diya gaya. Reason: **{reason}**"
     )
 
-# ----------------- BAN (PREFIX + SLASH) -----------------
+
+# ------------- MODERATION: BAN / UNBAN -------------
 
 @bot.command(name="ban")
 @commands.has_permissions(ban_members=True)
 async def ban_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason"):
-    if not await can_act(ctx, member):
+    if not await can_act_on(ctx, ctx.author, member):
         return
-    await member.ban(reason=reason)
-    await ctx.send(
-        "🔨 **Xtreme Ban Executed**\n"
-        f"👤 User: {member.mention}\n"
-        f"📄 Reason: {reason}\n"
-        f"👮 Mod: {ctx.author.mention}"
-    )
 
-@bot.tree.command(name="ban", description="Ban a member (Xtreme)")
+    await member.ban(reason=reason, delete_message_days=0)
+    await ctx.send(f"🔨 {member.mention} ko ban kar diya gaya. Reason: **{reason}**")
+
+
+@bot.tree.command(name="ban", description="Ban a member")
 @app_commands.checks.has_permissions(ban_members=True)
-@app_commands.describe(
-    member="Jisko ban karna hai",
-    reason="Reason (optional)"
-)
 async def ban_slash(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str = "No reason",
 ):
-    if not await can_act(interaction, member):
+    if not await await can_act_on(interaction, interaction.user, member):
         return
-    await member.ban(reason=reason)
+
+    await member.ban(reason=reason, delete_message_days=0)
     await interaction.response.send_message(
-        "🔨 **Xtreme Ban Executed**\n"
-        f"👤 User: {member.mention}\n"
-        f"📄 Reason: {reason}\n"
-        f"👮 Mod: {interaction.user.mention}"
+        f"🔨 {member.mention} ko ban kar diya gaya. Reason: **{reason}**"
     )
 
-# ----------------- TIMEOUT (PREFIX + SLASH) -----------------
 
+@bot.command(name="unban")
+@commands.has_permissions(ban_members=True)
+async def unban_prefix(ctx: commands.Context, *, user: discord.User):
+    await ctx.guild.unban(user)
+    await ctx.send(f"✅ {user.mention} ka ban hata diya gaya.")
+
+
+@bot.tree.command(name="unban", description="Unban a user (ID or mention)")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_slash(interaction: discord.Interaction, user: discord.User):
+    await interaction.guild.unban(user)
+    await interaction.response.send_message(f"✅ {user.mention} ka ban hata diya gaya.")
+
+
+# ------------- MODERATION: TIMEOUT -------------
+
+# prefix: !timeout @user 10m reason
 @bot.command(name="timeout")
 @commands.has_permissions(moderate_members=True)
 async def timeout_prefix(
     ctx: commands.Context,
     member: discord.Member,
     duration: str,
-    *, 
-    reason: str = "No reason"
+    *,
+    reason: str = "No reason",
 ):
-    await timeout_logic(ctx, member, duration, reason, slash=False)
+    duration = duration.lower()
+    if duration not in TIMEOUT_PRESET:
+        valid = ", ".join(TIMEOUT_PRESET.keys())
+        await ctx.send(f"❌ Duration galat hai. Use: {valid}")
+        return
 
-@bot.tree.command(name="timeout", description="Timeout / remove timeout (Xtreme)")
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.describe(
-    member="Jisko timeout karna hai",
-    duration="10s, 1m, 10m, 1h, 2h, remove",
-    reason="Reason (optional)"
-)
-@app_commands.choices(duration=[
+    delta = TIMEOUT_PRESET[duration]
+    await do_timeout(ctx, member, delta, reason)
+
+
+# slash: /timeout member duration reason
+TIMEOUT_CHOICES = [
     app_commands.Choice(name="10 seconds", value="10s"),
     app_commands.Choice(name="1 minute", value="1m"),
     app_commands.Choice(name="10 minutes", value="10m"),
     app_commands.Choice(name="1 hour", value="1h"),
     app_commands.Choice(name="2 hours", value="2h"),
-    app_commands.Choice(name="Remove timeout", value="remove"),
-])
+]
+
+
+@bot.tree.command(name="timeout", description="Timeout a member")
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.describe(
+    member="Kisko timeout karna hai?",
+    duration="Kitne time ke liye?",
+    reason="Reason (optional)",
+)
+@app_commands.choices(duration=TIMEOUT_CHOICES)
 async def timeout_slash(
     interaction: discord.Interaction,
     member: discord.Member,
     duration: app_commands.Choice[str],
     reason: str = "No reason",
 ):
-    await timeout_logic(interaction, member, duration.value, reason, slash=True)
+    key = duration.value
+    delta = TIMEOUT_PRESET.get(key)
+    if not delta:
+        await interaction.response.send_message("❌ Duration galat hai.", ephemeral=True)
+        return
 
-# ----------------- WARN (PREFIX + SLASH) -----------------
+    await do_timeout(interaction, member, delta, reason)
+
+
+# ------------- WARN + AUTO TIMEOUT -------------
+
+AUTO_TIMEOUT_AFTER = 3  # 3 warns ke baad auto timeout 10m
+
+
+async def send_warn_dm(member: discord.Member, guild_name: str, reason: str, count: int):
+    try:
+        await member.send(
+            f"⚠️ Tumhe **{guild_name}** me warn mila hai.\n"
+            f"Reason: **{reason}**\n"
+            f"Total warns: **{count}**"
+        )
+    except Exception:
+        # DMs closed etc
+        pass
+
 
 @bot.command(name="warn")
 @commands.has_permissions(moderate_members=True)
-async def warn_prefix(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason"):
-    await issue_warn(ctx, member, reason, slash=False)
+async def warn_prefix(
+    ctx: commands.Context,
+    member: discord.Member,
+    *,
+    reason: str = "No reason",
+):
+    if not await can_act_on(ctx, ctx.author, member):
+        return
 
-@bot.tree.command(name="warn", description="Warn a member (auto punish)")
+    count = add_warn(ctx.guild.id, member.id)
+    await send_warn_dm(member, ctx.guild.name, reason, count)
+
+    msg = (
+        f"⚠️ {member.mention} ko warn diya gaya. Reason: **{reason}**\n"
+        f"Total warns: **{count}**"
+    )
+
+    # auto-timeout
+    if count >= AUTO_TIMEOUT_AFTER:
+        delta = TIMEOUT_PRESET["10m"]
+        await member.timeout(
+            until=discord.utils.utcnow() + delta,
+            reason=f"Auto-timeout after {count} warns. Last reason: {reason}",
+        )
+        msg += "\n⏳ 3 warns complete → auto 10 minute timeout laga diya gaya."
+        remove_warns(ctx.guild.id, member.id)
+
+    await ctx.send(msg)
+
+
+@bot.tree.command(name="warn", description="Warn a member (auto timeout after 3)")
 @app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.describe(
-    member="Jisko warn karna hai",
-    reason="Reason"
-)
 async def warn_slash(
     interaction: discord.Interaction,
     member: discord.Member,
     reason: str = "No reason",
 ):
-    await issue_warn(interaction, member, reason, slash=True)
+    if not await can_act_on(interaction, interaction.user, member):
+        return
 
-@bot.command(name="warns")
-async def warns_prefix(ctx: commands.Context, member: discord.Member):
-    count = get_warnings(ctx.guild.id, member.id)
-    await ctx.send(f"{member.mention} ke total warns: **{count}**")
+    guild = interaction.guild
+    count = add_warn(guild.id, member.id)
+    await send_warn_dm(member, guild.name, reason, count)
 
-# ----------------- COINFLIP (PREFIX + SLASH) -----------------
+    msg = (
+        f"⚠️ {member.mention} ko warn diya gaya. Reason: **{reason}**\n"
+        f"Total warns: **{count}**"
+    )
+
+    if count >= AUTO_TIMEOUT_AFTER:
+        delta = TIMEOUT_PRESET["10m"]
+        await member.timeout(
+            until=discord.utils.utcnow() + delta,
+            reason=f"Auto-timeout after {count} warns. Last reason: {reason}",
+        )
+        msg += "\n⏳ 3 warns complete → auto 10 minute timeout laga diya gaya."
+        remove_warns(guild.id, member.id)
+
+    await interaction.response.send_message(msg)
+
+
+# ------------- COINFLIP -------------
 
 @bot.command(name="coinflip")
 async def coinflip_prefix(ctx: commands.Context):
-    result = random.choice(["Heads 🪙", "Tails 🪙"])
-    await ctx.send(f"🎲 Coin flipped: **{result}**")
+    result = random.choice(["Heads", "Tails"])
+    await ctx.send(f"🪙 Coin flip: **{result}**")
+
 
 @bot.tree.command(name="coinflip", description="Flip a coin")
 async def coinflip_slash(interaction: discord.Interaction):
-    result = random.choice(["Heads 🪙", "Tails 🪙"])
-    await interaction.response.send_message(f"🎲 Coin flipped: **{result}**")
+    result = random.choice(["Heads", "Tails"])
+    await interaction.response.send_message(f"🪙 Coin flip: **{result}**")
 
-# ----------------- HELP (PREFIX + SLASH) -----------------
 
-HELP_TEXT = (
-    "🌀 **XTREME HELP MENU**\n\n"
-    "⚔️ **Moderation**\n"
-    "`!kick @user reason` — Kick user\n"
-    "`!ban @user reason` — Ban user\n"
-    "`!timeout @user 10m reason` — Timeout (10s,1m,10m,1h,2h,remove)\n"
-    "`!warn @user reason` — Warn + auto punish\n"
-    "`!warns @user` — Total warns\n\n"
-    "🎲 **Fun**\n"
-    "`!coinflip` — Heads/Tails\n"
-)
+# ------------- HELP -------------
+
+HELP_TEXT = """
+**Xtreme Bot – Commands**
+
+**Prefix** (default: `!`)
+> `!help` – ye help menu
+> `!kick @user [reason]`
+> `!ban @user [reason]`
+> `!unban userID`
+> `!timeout @user <10s|1m|10m|1h|2h> [reason]`
+> `!warn @user [reason]` (3 warns → auto 10m timeout)
+> `!coinflip`
+
+**Slash**
+> `/help`
+> `/kick`
+> `/ban`
+> `/unban`
+> `/timeout`
+> `/warn`
+> `/coinflip`
+""".strip()
+
 
 @bot.command(name="help")
 async def help_prefix(ctx: commands.Context):
     await ctx.send(HELP_TEXT)
 
+
 @bot.tree.command(name="help", description="Show Xtreme help menu")
 async def help_slash(interaction: discord.Interaction):
-    await interaction.response.send_message(HELP_TEXT)
+    await interaction.response.send_message(HELP_TEXT, ephemeral=True)
 
-# ----------------- RUN BOT -----------------
+
+# ------------- RUN BOT -------------
 
 bot.run(DISCORD_BOT_TOKEN)
